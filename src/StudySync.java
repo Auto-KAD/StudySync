@@ -694,12 +694,35 @@ public class StudySync extends JFrame {
         // OPEN BUTTON
         // -----------------------------
 
+        JPanel buttonPanel =
+                new JPanel(
+                        new FlowLayout(
+                                FlowLayout.RIGHT,
+                                5,
+                                0
+                        )
+                );
+
         JButton openButton =
                 new JButton("OPEN");
 
         openButton.addActionListener(
                 e -> openFile(file)
         );
+
+        JButton aiButton =
+                new JButton("AI");
+
+        aiButton.setToolTipText(
+                "Analyze this resource with Gemini"
+        );
+
+        aiButton.addActionListener(
+                e -> showAIOptions(file)
+        );
+
+        buttonPanel.add(openButton);
+        buttonPanel.add(aiButton);
 
         card.add(
                 icon,
@@ -712,7 +735,7 @@ public class StudySync extends JFrame {
         );
 
         card.add(
-                openButton,
+                buttonPanel,
                 BorderLayout.EAST
         );
 
@@ -721,6 +744,274 @@ public class StudySync extends JFrame {
         resourcePanel.add(
                 Box.createVerticalStrut(8)
         );
+    }
+    // =============================================================
+// AI OPTIONS
+// =============================================================
+
+    private void showAIOptions(File file) {
+
+        String[] options = {
+                "Summarize",
+                "Explain the important concepts",
+                "Create study notes",
+                "Generate exam questions",
+                "Ask a custom question"
+        };
+
+        String selected =
+                (String) JOptionPane.showInputDialog(
+                        this,
+                        "What should StudySync AI do?",
+                        "StudySync AI",
+                        JOptionPane.PLAIN_MESSAGE,
+                        null,
+                        options,
+                        options[0]
+                );
+
+        if (selected == null) {
+            return;
+        }
+
+        String instruction;
+
+        switch (selected) {
+
+            case "Summarize":
+
+                instruction =
+                        """
+                        Summarize this resource.
+    
+                        Include:
+                        - Main topic
+                        - Important concepts
+                        - Key definitions
+                        - Important formulas or facts
+                        - A short final revision summary
+                        """;
+
+                break;
+
+            case "Explain the important concepts":
+
+                instruction =
+                        """
+                        Explain the important concepts in this
+                        resource in a way suitable for a university
+                        student preparing for an examination.
+    
+                        Start from the fundamentals and gradually
+                        explain the more difficult concepts.
+                        """;
+
+                break;
+
+            case "Create study notes":
+
+                instruction =
+                        """
+                        Convert this resource into structured
+                        study notes.
+    
+                        Use:
+                        - Headings
+                        - Subheadings
+                        - Bullet points
+                        - Definitions
+                        - Important formulas
+                        - Examples where present
+                        - Exam-important points
+                        """;
+
+                break;
+
+            case "Generate exam questions":
+
+                instruction =
+                        """
+                        Generate examination-oriented questions
+                        from this resource.
+    
+                        Include:
+                        - Short-answer questions
+                        - Descriptive questions
+                        - Conceptual questions
+                        - Application-based questions
+    
+                        Provide answers after the questions.
+                        """;
+
+                break;
+
+            case "Ask a custom question":
+
+                String question =
+                        JOptionPane.showInputDialog(
+                                this,
+                                "Ask something about this resource:",
+                                "StudySync AI",
+                                JOptionPane.QUESTION_MESSAGE
+                        );
+
+                if (question == null ||
+                        question.trim().isEmpty()) {
+
+                    return;
+                }
+
+                instruction = question;
+                break;
+
+            default:
+                return;
+        }
+
+        runAIAnalysis(
+                file,
+                instruction
+        );
+    }
+    // =============================================================
+// AI ANALYSIS
+// =============================================================
+
+    private void runAIAnalysis(
+            File file,
+            String instruction) {
+
+        JDialog dialog =
+                new JDialog(
+                        this,
+                        "StudySync AI",
+                        false
+                );
+
+        dialog.setSize(
+                850,
+                650
+        );
+
+        dialog.setLocationRelativeTo(this);
+
+        JTextArea output =
+                new JTextArea();
+
+        output.setEditable(false);
+
+        output.setLineWrap(true);
+
+        output.setWrapStyleWord(true);
+
+        output.setFont(
+                new Font(
+                        "Arial",
+                        Font.PLAIN,
+                        15
+                )
+        );
+
+        output.setText(
+                "StudySync AI is analyzing:\n\n"
+                        + file.getName()
+                        + "\n\n"
+                        + "Please wait..."
+        );
+
+        JScrollPane scrollPane =
+                new JScrollPane(output);
+
+        JPanel header =
+                new JPanel(
+                        new BorderLayout()
+                );
+
+        JLabel title =
+                new JLabel(
+                        "  ✨ StudySync AI"
+                );
+
+        title.setFont(
+                new Font(
+                        "Arial",
+                        Font.BOLD,
+                        20
+                )
+        );
+
+        JLabel resource =
+                new JLabel(
+                        "  " + file.getName()
+                );
+
+        resource.setForeground(
+                Color.GRAY
+        );
+
+        header.add(
+                title,
+                BorderLayout.NORTH
+        );
+
+        header.add(
+                resource,
+                BorderLayout.SOUTH
+        );
+
+        dialog.setLayout(
+                new BorderLayout()
+        );
+
+        dialog.add(
+                header,
+                BorderLayout.NORTH
+        );
+
+        dialog.add(
+                scrollPane,
+                BorderLayout.CENTER
+        );
+
+        dialog.setVisible(true);
+
+        /*
+         * Never call the network API on the Swing EDT.
+         */
+        new Thread(() -> {
+
+            try {
+
+                String result =
+                        GeminiAI.analyzeFile(
+                                file,
+                                instruction
+                        );
+
+                SwingUtilities.invokeLater(() -> {
+
+                    output.setText(
+                            result
+                    );
+
+                    output.setCaretPosition(0);
+                });
+
+            } catch (Exception ex) {
+
+                SwingUtilities.invokeLater(() -> {
+
+                    output.setText(
+                            "StudySync AI could not analyze "
+                                    + "this resource.\n\n"
+                                    + ex.getMessage()
+                    );
+
+                    output.setCaretPosition(0);
+                });
+            }
+
+        }, "StudySync-AI").start();
     }
 
     // =============================================================
@@ -812,9 +1103,7 @@ public class StudySync extends JFrame {
         return "Miscellaneous";
     }
 
-    // =============================================================
-    // KEYWORD MATCH
-    // =============================================================
+
 
     private boolean containsAny(
             String text,
