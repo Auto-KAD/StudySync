@@ -51,8 +51,8 @@ public class GeminiAI {
             );
         }
 
-         String apiKey ="REMOVED_SECRET";
-
+         String apiKey =
+                System.getenv("GEMINI_API_KEY");
 
         if (apiKey == null ||
                 apiKey.trim().isEmpty()) {
