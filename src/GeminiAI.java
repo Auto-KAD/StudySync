@@ -59,8 +59,6 @@ public class GeminiAI {
 
             throw new IllegalStateException(
                     "GEMINI_API_KEY is not configured.\n\n"
-                            + "Set the environment variable before "
-                            + "running StudySync."
             );
         }
 
