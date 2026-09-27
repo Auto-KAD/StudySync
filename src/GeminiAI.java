@@ -6,6 +6,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.util.Base64;
+
 public class GeminiAI {
 
     /*
@@ -50,14 +51,16 @@ public class GeminiAI {
             );
         }
 
-         String apiKey =
-                apiconfig.GEMINI_API_KEY;
+         String apiKey ="REMOVED_SECRET";
+
 
         if (apiKey == null ||
                 apiKey.trim().isEmpty()) {
 
             throw new IllegalStateException(
                     "GEMINI_API_KEY is not configured.\n\n"
+                            + "Set the environment variable before "
+                            + "running StudySync."
             );
         }
 
