@@ -6,7 +6,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.util.Base64;
-
 public class GeminiAI {
 
     /*
@@ -52,7 +51,7 @@ public class GeminiAI {
         }
 
          String apiKey =
-                System.getenv("GEMINI_API_KEY");
+                apiconfig.GEMINI_API_KEY;
 
         if (apiKey == null ||
                 apiKey.trim().isEmpty()) {
