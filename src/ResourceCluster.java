@@ -1,5 +1,4 @@
 import java.io.File;
-import java.util.*;
 
 public class ResourceCluster {
 
@@ -49,10 +48,6 @@ public class ResourceCluster {
             return Category.PREVIOUS_YEAR_PAPERS;
         }
 
-        // Detect years in filenames.
-        // Useful for files such as:
-        // SE_2024.pdf
-        // IVP_2025_question.pdf
         if (containsYear(name) &&
                 containsAny(name,
                         "paper",
@@ -116,24 +111,29 @@ public class ResourceCluster {
             return Category.BOOKS;
         }
 
-        // ---------- DEFAULT ----------
         return Category.MISCELLANEOUS;
     }
 
-    private static String getExtension(String fileName) {
+    private static String getExtension(
+            String fileName
+    ) {
 
-        int dot = fileName.lastIndexOf('.');
+        int dot =
+                fileName.lastIndexOf('.');
 
         if (dot == -1) {
             return "";
         }
 
-        return fileName.substring(dot + 1);
+        return fileName.substring(
+                dot + 1
+        );
     }
 
     private static boolean containsAny(
             String text,
-            String... keywords) {
+            String... keywords
+    ) {
 
         for (String keyword : keywords) {
 
@@ -145,11 +145,17 @@ public class ResourceCluster {
         return false;
     }
 
-    private static boolean containsYear(String text) {
+    private static boolean containsYear(
+            String text
+    ) {
 
-        for (int year = 2018; year <= 2035; year++) {
+        for (int year = 2018;
+             year <= 2035;
+             year++) {
 
-            if (text.contains(String.valueOf(year))) {
+            if (text.contains(
+                    String.valueOf(year)
+            )) {
                 return true;
             }
         }
