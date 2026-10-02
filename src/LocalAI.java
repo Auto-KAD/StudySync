@@ -1,8 +1,19 @@
-import java.io.*;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
+
 import java.nio.charset.StandardCharsets;
+
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -10,704 +21,1049 @@ import java.util.List;
  *
  * Local AI interface for StudySync.
  *
- * Current backend:
+ * Backend:
  * Ollama -> Qwen3.5 4B
  *
- * This class is intentionally independent of StudySync and GeminiAI.
+ * Supports:
+ * - Text-only requests
+ * - Multimodal requests with document images
  *
- * Phase 1:
- * Java -> Ollama -> Qwen3.5 4B
+ * Visual safety:
+ * - Limits the number of images sent to Qwen
+ * - Ignores invalid image objects
+ * - Keeps the image payload bounded
  *
- * Later:
- * LocalAI -> DocumentProcessor -> PDFBox / Apache POI
- * -> visual processing -> Qwen Vision
+ * This class is independent of StudySync UI and GeminiAI.
  */
-public class LocalAI {
+public class LocalAI implements AIService {
 
-    // ============================================================
-    // CONFIGURATION
-    // ============================================================
+        // =========================================================
+        // CONFIGURATION
+        // =========================================================
 
-    private static final String OLLAMA_URL = "http://localhost:11434/api/chat";
+        private static final String OLLAMA_URL = "http://localhost:11434/api/chat";
 
-    private static final String MODEL = "qwen3.5:4b";
+        private static final String MODEL = "qwen3.5:4b";
 
-    /*
-     * Keep the model loaded after a request.
-     *
-     * This prevents StudySync from repeatedly loading the
-     * 3.4 GB model into memory.
-     */
-    private static final String KEEP_ALIVE = "30m";
+        /**
+         * Keep the model loaded between requests.
+         */
+        private static final String KEEP_ALIVE = "30m";
 
-    /*
-     * Connection timeout.
-     */
-    private static final int CONNECT_TIMEOUT = 10_000;
+        /**
+         * Maximum number of visual inputs that may be
+         * sent to Qwen in a single request.
+         *
+         * This prevents accidentally sending dozens of
+         * rendered document pages to the local model.
+         */
+        private static final int MAX_IMAGES_PER_REQUEST = 5;
 
-    /*
-     * Read timeout.
-     *
-     * Qwen can take some time to generate an answer,
-     * especially during the first request.
-     *
-     * 5 minutes gives it enough room for local inference.
-     */
-    private static final int READ_TIMEOUT = 300_000;
+        private static final int CONNECT_TIMEOUT = 10_000;
 
-    // ============================================================
-    // SYSTEM PROMPT
-    // ============================================================
+        private static final int READ_TIMEOUT = 300_000;
 
-    private static final String SYSTEM_PROMPT = """
-            You are StudySync AI, a local academic assistant.
+        // =========================================================
+        // SYSTEM PROMPT
+        // =========================================================
 
-            Your job is to help students understand their study
-            resources clearly and accurately.
+        private static final String SYSTEM_PROMPT = """
+                        You are StudySync AI, a local academic assistant.
 
-            Rules:
-            - Answer directly and avoid unnecessary preamble.
-            - Do not repeat the user's question.
-            - Do not provide a long discussion of your reasoning.
-            - Give the final answer clearly.
-            - Use headings, bullet points, tables, and numbered
-              lists when they improve readability.
-            - For academic questions, explain concepts step by step
-              when necessary.
-            - Do not invent information that is not present in the
-              supplied resource context.
-            - If the supplied resources do not contain enough
-              information, clearly say so.
-            - When comparing concepts, make the differences explicit.
-            - Preserve formulas, algorithms, terminology, and
-              technical names accurately.
-            """;
+                        Your job is to help students understand their study
+                        resources clearly and accurately.
 
-    // ============================================================
-    // SIMPLE TEXT ANALYSIS
-    // ============================================================
+                        Rules:
 
-    /**
-     * Sends a general instruction to Qwen.
-     *
-     * This method is useful for testing LocalAI before connecting
-     * it to StudySync.
-     */
-    public static String ask(String instruction) throws Exception {
+                        - Answer directly and avoid unnecessary preamble.
+                        - Do not repeat the user's question.
+                        - Do not provide a long discussion of your reasoning.
+                        - Give the final answer clearly.
+                        - Use headings, bullet points, tables, and numbered
+                          lists when they improve readability.
+                        - For academic questions, explain concepts step by step
+                          when necessary.
+                        - Do not invent information that is not present in the
+                          supplied resource context or visual material.
+                        - If the supplied resources do not contain enough
+                          information, clearly say so.
+                        - When comparing concepts, make the differences explicit.
+                        - Preserve formulas, algorithms, terminology, and
+                          technical names accurately.
+                        - When visual material is supplied, inspect it carefully
+                          and use information visible in the images.
+                        - Do not describe your hidden reasoning process.
+                        """;
 
-        if (instruction == null ||
-                instruction.trim().isEmpty()) {
+        // =========================================================
+        // MAIN AI SERVICE
+        // =========================================================
 
-            throw new IllegalArgumentException(
-                    "AI instruction cannot be empty.");
+        @Override
+        public AIResponse ask(
+                        AIRequest request) throws Exception {
+
+                if (request == null) {
+
+                        throw new IllegalArgumentException(
+                                        "AI request cannot be null.");
+                }
+
+                String question = request.getQuestion();
+
+                String context = request.getContext();
+
+                if (question == null ||
+                                question.trim().isEmpty()) {
+
+                        throw new IllegalArgumentException(
+                                        "AI question cannot be empty.");
+                }
+
+                if (context == null) {
+                        context = "";
+                }
+
+                // =====================================================
+                // BUILD PROMPT
+                // =====================================================
+
+                StringBuilder prompt = new StringBuilder();
+
+                if (!context.isBlank()) {
+
+                        prompt.append(context);
+
+                        prompt.append("\n\n");
+                }
+
+                prompt.append(
+                                "USER QUESTION\n");
+
+                prompt.append(
+                                "-------------\n");
+
+                prompt.append(
+                                question);
+
+                prompt.append(
+                                "\n\n");
+
+                prompt.append(
+                                "Answer the question using the supplied "
+                                                + "academic resources.\n");
+
+                prompt.append(
+                                "Use all relevant resources.\n");
+
+                if (request.hasImages()) {
+
+                        prompt.append(
+                                        "Visual material has also been supplied. "
+                                                        + "Inspect the supplied images carefully "
+                                                        + "and use relevant visual information.\n");
+
+                        prompt.append(
+                                        "Only the selected visual material is available "
+                                                        + "for visual analysis.\n");
+                }
+
+                prompt.append(
+                                "Do not invent information.\n");
+
+                prompt.append(
+                                "Be concise and student-friendly.");
+
+                // =====================================================
+                // SELECT VISUAL INPUTS
+                // =====================================================
+
+                List<DocumentImage> selectedImages = request.getImages(
+                                MAX_IMAGES_PER_REQUEST);
+
+                System.out.println(
+                                "LocalAI: "
+                                                + selectedImages.size()
+                                                + " visual input(s) selected.");
+
+                // =====================================================
+                // SEND REQUEST
+                // =====================================================
+
+                String result = sendToOllama(
+                                prompt.toString(),
+                                selectedImages);
+
+                return new AIResponse(result);
         }
 
-        return sendToOllama(instruction);
-    }
+        // =========================================================
+        // TEXT + MULTIMODAL OLLAMA REQUEST
+        // =========================================================
 
-    // ============================================================
-    // FILE API
-    // ============================================================
+        /**
+         * Sends a prompt with optional document images.
+         *
+         * Ollama expects multimodal images as Base64 strings
+         * inside the user's message.
+         */
+        private static String sendToOllama(
+                        String prompt,
+                        List<DocumentImage> images) throws Exception {
 
-    /**
-     * Analyze a single file.
-     *
-     * NOTE:
-     * Document parsing is intentionally NOT implemented yet.
-     *
-     * For Phase 1 this simply tells the model about the file.
-     *
-     * PDFBox / POI / visual processing will be added later.
-     */
-    public static String analyzeFile(
-            File file,
-            String instruction) throws Exception {
+                if (images == null) {
+                        images = Collections.emptyList();
+                }
 
-        validateFile(file);
+                String json = buildRequestJson(
+                                prompt,
+                                images);
 
-        if (instruction == null ||
-                instruction.trim().isEmpty()) {
-
-            instruction = "Analyze the supplied resource and explain " +
-                    "its important academic content.";
+                return sendRawOllamaRequest(json);
         }
 
-        String prompt = "RESOURCE FILE:\n" +
-                file.getName() +
-                "\n\n" +
-                "USER REQUEST:\n" +
-                instruction +
-                "\n\n" +
-                "Important:\n" +
-                "The actual document contents have not yet been " +
-                "parsed in this Phase 1 test. Do not invent its " +
-                "contents.";
+        // =========================================================
+        // RAW OLLAMA HTTP REQUEST
+        // =========================================================
 
-        return sendToOllama(prompt);
-    }
+        /**
+         * Performs the actual HTTP request to Ollama.
+         *
+         * Both text-only and multimodal requests use this method.
+         */
+        private static String sendRawOllamaRequest(
+                        String json) throws Exception {
 
-    /**
-     * Analyze multiple files.
-     *
-     * Same Phase 1 limitation:
-     * actual document extraction will be added later.
-     */
-    public static String analyzeFiles(
-            List<File> files,
-            String instruction) throws Exception {
+                HttpURLConnection connection = null;
 
-        if (files == null ||
-                files.isEmpty()) {
+                try {
 
-            throw new IllegalArgumentException(
-                    "No files were supplied for AI analysis.");
-        }
+                        URL url = URI.create(
+                                        OLLAMA_URL).toURL();
 
-        if (instruction == null ||
-                instruction.trim().isEmpty()) {
+                        connection = (HttpURLConnection) url.openConnection();
 
-            instruction = "Analyze the supplied study resources " +
-                    "and summarize their important content.";
-        }
+                        connection.setRequestMethod(
+                                        "POST");
 
-        StringBuilder prompt = new StringBuilder();
+                        connection.setConnectTimeout(
+                                        CONNECT_TIMEOUT);
 
-        prompt.append(
-                "SELECTED STUDY RESOURCES:\n\n");
+                        connection.setReadTimeout(
+                                        READ_TIMEOUT);
 
-        for (int i = 0; i < files.size(); i++) {
+                        connection.setDoOutput(
+                                        true);
 
-            File file = files.get(i);
+                        connection.setRequestProperty(
+                                        "Content-Type",
+                                        "application/json");
 
-            validateFile(file);
+                        connection.setRequestProperty(
+                                        "Accept",
+                                        "application/json");
 
-            prompt.append(i + 1)
-                    .append(". ")
-                    .append(file.getName())
-                    .append("\n");
-        }
+                        // =================================================
+                        // SEND JSON
+                        // =================================================
 
-        prompt.append(
-                "\nUSER REQUEST:\n");
+                        try (
+                                        OutputStream output = connection.getOutputStream()) {
 
-        prompt.append(instruction);
+                                output.write(
+                                                json.getBytes(
+                                                                StandardCharsets.UTF_8));
+                        }
 
-        prompt.append(
-                """
+                        // =================================================
+                        // READ RESPONSE
+                        // =================================================
 
-                        \n\nImportant:
-                        The actual contents of these documents have not
-                        yet been parsed in this Phase 1 test.
+                        int status = connection.getResponseCode();
 
-                        Do not invent document contents.
+                        InputStream stream;
 
-                        The document-processing layer will later provide
-                        extracted text, tables, images, graphs, diagrams,
-                        and other relevant visual information.
-                        """);
+                        if (status >= 200 &&
+                                        status < 300) {
 
-        return sendToOllama(
-                prompt.toString());
-    }
-
-    // ============================================================
-    // OLLAMA COMMUNICATION
-    // ============================================================
-
-    private static String sendToOllama(
-            String userPrompt) throws Exception {
-
-        HttpURLConnection connection = null;
-
-        try {
-
-            URL url = URI.create(OLLAMA_URL)
-                    .toURL();
-
-            connection = (HttpURLConnection) url.openConnection();
-
-            connection.setRequestMethod("POST");
-
-            connection.setConnectTimeout(
-                    CONNECT_TIMEOUT);
-
-            connection.setReadTimeout(
-                    READ_TIMEOUT);
-
-            connection.setDoOutput(true);
-
-            connection.setRequestProperty(
-                    "Content-Type",
-                    "application/json");
-
-            connection.setRequestProperty(
-                    "Accept",
-                    "application/json");
-
-            // ----------------------------------------------------
-            // JSON REQUEST
-            // ----------------------------------------------------
-
-            String json = buildRequestJson(userPrompt);
-
-            try (OutputStream output = connection.getOutputStream()) {
-
-                output.write(
-                        json.getBytes(
-                                StandardCharsets.UTF_8));
-            }
-
-            // ----------------------------------------------------
-            // RESPONSE
-            // ----------------------------------------------------
-
-            int status = connection.getResponseCode();
-
-            InputStream stream;
-
-            if (status >= 200 &&
-                    status < 300) {
-
-                stream = connection.getInputStream();
-
-            } else {
-
-                stream = connection.getErrorStream();
-            }
-
-            String response = readStream(stream);
-
-            if (status < 200 ||
-                    status >= 300) {
-
-                throw new IOException(
-                        "Ollama returned HTTP " +
-                                status +
-                                ":\n" +
-                                response);
-            }
-
-            // ----------------------------------------------------
-            // EXTRACT RESPONSE TEXT
-            // ----------------------------------------------------
-
-            return extractResponse(response);
-
-        } finally {
-
-            if (connection != null) {
-                connection.disconnect();
-            }
-        }
-    }
-
-    // ============================================================
-    // BUILD OLLAMA JSON
-    // ============================================================
-
-    private static String buildRequestJson(
-            String userPrompt) {
-
-        return "{"
-                + "\"model\":\"" + escapeJson(MODEL) + "\","
-                + "\"messages\":["
-                + "{"
-                + "\"role\":\"system\","
-                + "\"content\":\"" + escapeJson(SYSTEM_PROMPT) + "\""
-                + "},"
-                + "{"
-                + "\"role\":\"user\","
-                + "\"content\":\"" + escapeJson(userPrompt) + "\""
-                + "}"
-                + "],"
-                + "\"stream\":false,"
-                + "\"think\":false,"
-                + "\"keep_alive\":\"30m\""
-                + "}";
-    }
-
-    // ============================================================
-    // JSON RESPONSE EXTRACTION
-    // ============================================================
-
-    /**
-     * Extracts:
-     *
-     * {
-     * "message": {
-     * "role": "assistant",
-     * "content": "..."
-     * }
-     * }
-     *
-     * without requiring a JSON library.
-     *
-     * We intentionally keep Phase 1 dependency-free.
-     */
-    private static String extractResponse(
-            String json) throws IOException {
-
-        if (json == null ||
-                json.trim().isEmpty()) {
-
-            throw new IOException(
-                    "Ollama returned an empty response.");
-        }
-
-        String marker = "\"content\":\"";
-
-        int start = json.indexOf(marker);
-
-        if (start == -1) {
-
-            throw new IOException(
-                    "Could not find the AI response in Ollama output.\n\n"
-                            + json);
-        }
-
-        start += marker.length();
-
-        StringBuilder result = new StringBuilder();
-
-        boolean escaped = false;
-
-        for (int i = start; i < json.length(); i++) {
-
-            char c = json.charAt(i);
-
-            if (escaped) {
-
-                switch (c) {
-
-                    case 'n':
-                        result.append('\n');
-                        break;
-
-                    case 'r':
-                        result.append('\r');
-                        break;
-
-                    case 't':
-                        result.append('\t');
-                        break;
-
-                    case '"':
-                        result.append('"');
-                        break;
-
-                    case '\\':
-                        result.append('\\');
-                        break;
-
-                    case '/':
-                        result.append('/');
-                        break;
-
-                    case 'b':
-                        result.append('\b');
-                        break;
-
-                    case 'f':
-                        result.append('\f');
-                        break;
-
-                    case 'u':
-
-                        if (i + 4 < json.length()) {
-
-                            String hex = json.substring(
-                                    i + 1,
-                                    i + 5);
-
-                            try {
-
-                                result.append(
-                                        (char) Integer.parseInt(
-                                                hex,
-                                                16));
-
-                                i += 4;
-
-                            } catch (NumberFormatException e) {
-
-                                result.append("\\u");
-                                result.append(hex);
-
-                                i += 4;
-                            }
+                                stream = connection.getInputStream();
 
                         } else {
 
-                            result.append("\\u");
+                                stream = connection.getErrorStream();
                         }
 
-                        break;
+                        String response = readStream(stream);
 
-                    default:
-                        result.append(c);
+                        // =================================================
+                        // ERROR HANDLING
+                        // =================================================
+
+                        if (status < 200 ||
+                                        status >= 300) {
+
+                                throw new IOException(
+                                                "Ollama returned HTTP "
+                                                                + status
+                                                                + ":\n"
+                                                                + response);
+                        }
+
+                        // =================================================
+                        // EXTRACT AI RESPONSE
+                        // =================================================
+
+                        return extractResponse(
+                                        response);
+
+                } finally {
+
+                        if (connection != null) {
+                                connection.disconnect();
+                        }
+                }
+        }
+
+        // =========================================================
+        // BUILD OLLAMA JSON
+        // =========================================================
+
+        /**
+         * Builds an Ollama /api/chat request.
+         *
+         * Text-only:
+         *
+         * "messages": [...]
+         *
+         * Multimodal:
+         *
+         * "messages": [
+         * {
+         * "role": "user",
+         * "content": "...",
+         * "images": [
+         * "BASE64_IMAGE_1"
+         * ]
+         * }
+         * ]
+         */
+        private static String buildRequestJson(
+                        String userPrompt,
+                        List<DocumentImage> images) {
+
+                StringBuilder json = new StringBuilder();
+
+                json.append("{");
+
+                // =====================================================
+                // MODEL
+                // =====================================================
+
+                json.append(
+                                "\"model\":\""
+                                                + escapeJson(MODEL)
+                                                + "\",");
+
+                // =====================================================
+                // MESSAGES
+                // =====================================================
+
+                json.append(
+                                "\"messages\":[");
+
+                // =====================================================
+                // SYSTEM MESSAGE
+                // =====================================================
+
+                json.append("{");
+
+                json.append(
+                                "\"role\":\"system\",");
+
+                json.append(
+                                "\"content\":\""
+                                                + escapeJson(
+                                                                SYSTEM_PROMPT)
+                                                + "\"");
+
+                json.append("},");
+
+                // =====================================================
+                // USER MESSAGE
+                // =====================================================
+
+                json.append("{");
+
+                json.append(
+                                "\"role\":\"user\",");
+
+                json.append(
+                                "\"content\":\""
+                                                + escapeJson(
+                                                                userPrompt)
+                                                + "\"");
+
+                // =====================================================
+                // IMAGES
+                // =====================================================
+
+                List<DocumentImage> validImages = getValidImages(
+                                images,
+                                MAX_IMAGES_PER_REQUEST);
+
+                if (!validImages.isEmpty()) {
+
+                        json.append(",");
+
+                        json.append(
+                                        "\"images\":[");
+
+                        for (int i = 0; i < validImages.size(); i++) {
+
+                                if (i > 0) {
+                                        json.append(",");
+                                }
+
+                                DocumentImage image = validImages.get(i);
+
+                                String base64 = Base64
+                                                .getEncoder()
+                                                .encodeToString(
+                                                                image.getImageData());
+
+                                json.append("\"");
+
+                                json.append(
+                                                base64);
+
+                                json.append("\"");
+                        }
+
+                        json.append("]");
                 }
 
-                escaped = false;
+                // =====================================================
+                // CLOSE USER MESSAGE
+                // =====================================================
 
-            } else if (c == '\\') {
+                json.append("}");
 
-                escaped = true;
+                // =====================================================
+                // CLOSE MESSAGES
+                // =====================================================
 
-            } else if (c == '"') {
+                json.append("],");
 
-                break;
+                // =====================================================
+                // GENERATION SETTINGS
+                // =====================================================
 
-            } else {
+                json.append("\"stream\":false,");
+                json.append("\"think\":false,");
 
-                result.append(c);
-            }
+                json.append("\"options\":{");
+                json.append("\"num_ctx\":16384");
+                json.append("},");
+
+                json.append(
+                                "\"keep_alive\":\""
+                                                + KEEP_ALIVE
+                                                + "\"");
+
+                // =====================================================
+                // CLOSE ROOT JSON OBJECT
+                // =====================================================
+
+                json.append("}");
+
+                return json.toString();
         }
 
-        return result.toString().trim();
-    }
+        // =========================================================
+        // VISUAL INPUT FILTERING
+        // =========================================================
 
-    // ============================================================
-    // FILE VALIDATION
-    // ============================================================
+        /**
+         * Returns only valid visual inputs and enforces
+         * the maximum image limit.
+         *
+         * This is the final safety boundary before Base64
+         * encoding and sending images to Ollama.
+         */
+        private static List<DocumentImage> getValidImages(
+                        List<DocumentImage> images,
+                        int maximum) {
 
-    private static void validateFile(
-            File file) {
+                if (images == null ||
+                                images.isEmpty() ||
+                                maximum <= 0) {
 
-        if (file == null) {
+                        return Collections.emptyList();
+                }
 
-            throw new IllegalArgumentException(
-                    "File cannot be null.");
+                List<DocumentImage> validImages = new ArrayList<>();
+
+                for (DocumentImage image : images) {
+
+                        if (image == null) {
+                                continue;
+                        }
+
+                        byte[] data = image.getImageData();
+
+                        if (data == null ||
+                                        data.length == 0) {
+
+                                continue;
+                        }
+
+                        validImages.add(image);
+
+                        if (validImages.size() >= maximum) {
+                                break;
+                        }
+                }
+
+                return validImages;
         }
 
-        if (!file.exists()) {
+        // =========================================================
+        // SIMPLE TEXT ANALYSIS
+        // =========================================================
 
-            throw new IllegalArgumentException(
-                    "File does not exist:\n" +
-                            file.getAbsolutePath());
+        /**
+         * Convenience method for testing LocalAI directly.
+         *
+         * This is not the main application API.
+         */
+        public static String ask(
+                        String instruction) throws Exception {
+
+                if (instruction == null ||
+                                instruction.trim().isEmpty()) {
+
+                        throw new IllegalArgumentException(
+                                        "AI instruction cannot be empty.");
+                }
+
+                return sendToOllama(
+                                instruction,
+                                Collections.emptyList());
         }
 
-        if (!file.isFile()) {
+        // =========================================================
+        // FILE API
+        // =========================================================
 
-            throw new IllegalArgumentException(
-                    "Path is not a file:\n" +
-                            file.getAbsolutePath());
-        }
-    }
+        /**
+         * Analyze a single file.
+         *
+         * Kept temporarily for compatibility with older
+         * StudySync code.
+         *
+         * Preferred architecture:
+         *
+         * File
+         * -> DocumentService
+         * -> DocumentContextBuilder
+         * -> AIRequest
+         * -> LocalAI
+         */
+        public static String analyzeFile(
+                        File file,
+                        String instruction) throws Exception {
 
-    // ============================================================
-    // STREAM READER
-    // ============================================================
+                validateFile(file);
 
-    private static String readStream(
-            InputStream stream) throws IOException {
+                if (instruction == null ||
+                                instruction.trim().isEmpty()) {
 
-        if (stream == null) {
-            return "";
-        }
+                        instruction = "Analyze the supplied resource and "
+                                        + "explain its important academic content.";
+                }
 
-        StringBuilder result = new StringBuilder();
+                String prompt = "RESOURCE FILE:\n"
+                                + file.getName()
+                                + "\n\n"
+                                + "USER REQUEST:\n"
+                                + instruction
+                                + "\n\n"
+                                + "Important:\n"
+                                + "The document contents must be supplied "
+                                + "through the document processing layer. "
+                                + "Do not invent contents that were not supplied.";
 
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(
-                        stream,
-                        StandardCharsets.UTF_8))) {
-
-            String line;
-
-            while ((line = reader.readLine()) != null) {
-
-                result.append(line)
-                        .append('\n');
-            }
-        }
-
-        return result.toString().trim();
-    }
-
-    // ============================================================
-    // JSON ESCAPING
-    // ============================================================
-
-    private static String escapeJson(
-            String text) {
-
-        if (text == null) {
-            return "";
+                return sendToOllama(
+                                prompt,
+                                Collections.emptyList());
         }
 
-        StringBuilder result = new StringBuilder();
+        /**
+         * Analyze multiple files.
+         *
+         * Kept temporarily for compatibility.
+         *
+         * Preferred architecture:
+         *
+         * Files
+         * -> DocumentService
+         * -> DocumentContextBuilder
+         * -> AIRequest
+         * -> LocalAI
+         */
+        public static String analyzeFiles(
+                        List<File> files,
+                        String instruction) throws Exception {
 
-        for (char c : text.toCharArray()) {
+                if (files == null ||
+                                files.isEmpty()) {
 
-            switch (c) {
+                        throw new IllegalArgumentException(
+                                        "No files were supplied for AI analysis.");
+                }
 
-                case '"':
-                    result.append("\\\"");
-                    break;
+                if (instruction == null ||
+                                instruction.trim().isEmpty()) {
 
-                case '\\':
-                    result.append("\\\\");
-                    break;
+                        instruction = "Analyze the supplied study resources "
+                                        + "and summarize their important content.";
+                }
 
-                case '\b':
-                    result.append("\\b");
-                    break;
+                StringBuilder prompt = new StringBuilder();
 
-                case '\f':
-                    result.append("\\f");
-                    break;
+                prompt.append(
+                                "SELECTED STUDY RESOURCES:\n\n");
 
-                case '\n':
-                    result.append("\\n");
-                    break;
+                for (int i = 0; i < files.size(); i++) {
 
-                case '\r':
-                    result.append("\\r");
-                    break;
+                        File file = files.get(i);
 
-                case '\t':
-                    result.append("\\t");
-                    break;
+                        validateFile(file);
 
-                default:
+                        prompt.append(
+                                        i + 1);
 
-                    if (c < 32) {
+                        prompt.append(
+                                        ". ");
 
-                        result.append(
-                                String.format(
-                                        "\\u%04x",
-                                        (int) c));
+                        prompt.append(
+                                        file.getName());
 
-                    } else {
+                        prompt.append(
+                                        "\n");
+                }
 
-                        result.append(c);
-                    }
-            }
+                prompt.append(
+                                "\nUSER REQUEST:\n");
+
+                prompt.append(
+                                instruction);
+
+                prompt.append(
+                                "\n\nImportant:\n"
+                                                + "The actual contents of these documents "
+                                                + "must be supplied through the document "
+                                                + "processing layer.\n"
+                                                + "Do not invent document contents.");
+
+                return sendToOllama(
+                                prompt.toString(),
+                                Collections.emptyList());
         }
 
-        return result.toString();
-    }
+        // =========================================================
+        // RESPONSE EXTRACTION
+        // =========================================================
 
-    // ============================================================
-    // CONNECTION TEST
-    // ============================================================
+        /**
+         * Extracts message.content from the Ollama JSON response.
+         *
+         * This parser handles the escaped characters normally
+         * returned inside the content field.
+         */
+        private static String extractResponse(
+                        String json) throws IOException {
 
-    /**
-     * Simple health check.
-     *
-     * Returns true if Ollama is reachable.
-     */
-    public static boolean isOllamaRunning() {
+                if (json == null ||
+                                json.trim().isEmpty()) {
 
-        HttpURLConnection connection = null;
+                        throw new IOException(
+                                        "Ollama returned an empty response.");
+                }
 
-        try {
+                String marker = "\"content\":\"";
 
-            URL url = URI.create(
-                    "http://localhost:11434/api/tags").toURL();
+                int start = json.indexOf(marker);
 
-            connection = (HttpURLConnection) url.openConnection();
+                if (start == -1) {
 
-            connection.setRequestMethod("GET");
+                        throw new IOException(
+                                        "Could not find the AI response "
+                                                        + "in Ollama output.\n\n"
+                                                        + json);
+                }
 
-            connection.setConnectTimeout(
-                    3000);
+                start += marker.length();
 
-            connection.setReadTimeout(
-                    3000);
+                StringBuilder result = new StringBuilder();
 
-            return connection.getResponseCode() == 200;
+                boolean escaped = false;
 
-        } catch (Exception e) {
+                for (int i = start; i < json.length(); i++) {
 
-            return false;
+                        char c = json.charAt(i);
 
-        } finally {
+                        if (escaped) {
 
-            if (connection != null) {
-                connection.disconnect();
-            }
+                                switch (c) {
+
+                                        case 'n':
+                                                result.append('\n');
+                                                break;
+
+                                        case 'r':
+                                                result.append('\r');
+                                                break;
+
+                                        case 't':
+                                                result.append('\t');
+                                                break;
+
+                                        case '"':
+                                                result.append('"');
+                                                break;
+
+                                        case '\\':
+                                                result.append('\\');
+                                                break;
+
+                                        case '/':
+                                                result.append('/');
+                                                break;
+
+                                        case 'b':
+                                                result.append('\b');
+                                                break;
+
+                                        case 'f':
+                                                result.append('\f');
+                                                break;
+
+                                        case 'u':
+
+                                                if (i + 4 < json.length()) {
+
+                                                        String hex = json.substring(
+                                                                        i + 1,
+                                                                        i + 5);
+
+                                                        try {
+
+                                                                result.append(
+                                                                                (char) Integer.parseInt(
+                                                                                                hex,
+                                                                                                16));
+
+                                                                i += 4;
+
+                                                        } catch (NumberFormatException e) {
+
+                                                                result.append(
+                                                                                "\\u");
+
+                                                                result.append(
+                                                                                hex);
+
+                                                                i += 4;
+                                                        }
+
+                                                } else {
+
+                                                        result.append(
+                                                                        "\\u");
+                                                }
+
+                                                break;
+
+                                        default:
+                                                result.append(c);
+                                }
+
+                                escaped = false;
+
+                        } else if (c == '\\') {
+
+                                escaped = true;
+
+                        } else if (c == '"') {
+
+                                break;
+
+                        } else {
+
+                                result.append(c);
+                        }
+                }
+
+                return result
+                                .toString()
+                                .trim();
         }
-    }
 
-    // ============================================================
-    // MODEL TEST
-    // ============================================================
+        // =========================================================
+        // FILE VALIDATION
+        // =========================================================
 
-    public static void main(
-            String[] args) {
+        private static void validateFile(
+                        File file) {
 
-        System.out.println();
-        System.out.println(
-                "==========================================");
-        System.out.println(
-                "       StudySync LocalAI Test");
-        System.out.println(
-                "==========================================");
-        System.out.println();
+                if (file == null) {
 
-        System.out.println(
-                "Model: " + MODEL);
+                        throw new IllegalArgumentException(
+                                        "File cannot be null.");
+                }
 
-        System.out.println(
-                "Ollama: " +
-                        (isOllamaRunning()
-                                ? "ONLINE"
-                                : "OFFLINE"));
+                if (!file.exists()) {
 
-        System.out.println();
+                        throw new IllegalArgumentException(
+                                        "File does not exist:\n"
+                                                        + file.getAbsolutePath());
+                }
 
-        if (!isOllamaRunning()) {
+                if (!file.isFile()) {
 
-            System.out.println(
-                    "Ollama is not running.");
+                        throw new IllegalArgumentException(
+                                        "Path is not a file:\n"
+                                                        + file.getAbsolutePath());
+                }
 
-            System.out.println(
-                    "Start it with:");
+                if (!file.canRead()) {
 
-            System.out.println(
-                    "ollama serve");
-
-            return;
+                        throw new IllegalArgumentException(
+                                        "File cannot be read:\n"
+                                                        + file.getAbsolutePath());
+                }
         }
 
-        try {
+        // =========================================================
+        // STREAM READER
+        // =========================================================
 
-            System.out.println(
-                    "Sending test request to Qwen3.5 4B...");
+        private static String readStream(
+                        InputStream stream) throws IOException {
 
-            System.out.println();
+                if (stream == null) {
+                        return "";
+                }
 
-            String response = ask(
-                    "Say hello to me in one short sentence. "
-                            + "Do not explain your reasoning.");
+                StringBuilder result = new StringBuilder();
 
-            System.out.println(
-                    "Qwen response:");
+                try (
+                                BufferedReader reader = new BufferedReader(
+                                                new InputStreamReader(
+                                                                stream,
+                                                                StandardCharsets.UTF_8))) {
 
-            System.out.println(
-                    "------------------------------------------");
+                        String line;
 
-            System.out.println(
-                    response);
+                        while ((line = reader.readLine()) != null) {
 
-            System.out.println(
-                    "------------------------------------------");
+                                result.append(line)
+                                                .append('\n');
+                        }
+                }
 
-            System.out.println();
-
-            System.out.println(
-                    "LOCAL AI TEST PASSED.");
-
-        } catch (Exception e) {
-
-            System.out.println();
-            System.out.println(
-                    "LOCAL AI TEST FAILED.");
-
-            System.out.println();
-
-            e.printStackTrace();
+                return result
+                                .toString()
+                                .trim();
         }
-    }
+
+        // =========================================================
+        // JSON ESCAPING
+        // =========================================================
+
+        private static String escapeJson(
+                        String text) {
+
+                if (text == null) {
+                        return "";
+                }
+
+                StringBuilder result = new StringBuilder();
+
+                for (char c : text.toCharArray()) {
+
+                        switch (c) {
+
+                                case '"':
+                                        result.append("\\\"");
+                                        break;
+
+                                case '\\':
+                                        result.append("\\\\");
+                                        break;
+
+                                case '\b':
+                                        result.append("\\b");
+                                        break;
+
+                                case '\f':
+                                        result.append("\\f");
+                                        break;
+
+                                case '\n':
+                                        result.append("\\n");
+                                        break;
+
+                                case '\r':
+                                        result.append("\\r");
+                                        break;
+
+                                case '\t':
+                                        result.append("\\t");
+                                        break;
+
+                                default:
+
+                                        if (c < 32) {
+
+                                                result.append(
+                                                                String.format(
+                                                                                "\\u%04x",
+                                                                                (int) c));
+
+                                        } else {
+
+                                                result.append(c);
+                                        }
+                        }
+                }
+
+                return result.toString();
+        }
+
+        // =========================================================
+        // OLLAMA CONNECTION TEST
+        // =========================================================
+
+        public static boolean isOllamaRunning() {
+
+                HttpURLConnection connection = null;
+
+                try {
+
+                        URL url = URI.create(
+                                        "http://localhost:11434/api/tags").toURL();
+
+                        connection = (HttpURLConnection) url.openConnection();
+
+                        connection.setRequestMethod(
+                                        "GET");
+
+                        connection.setConnectTimeout(
+                                        3000);
+
+                        connection.setReadTimeout(
+                                        3000);
+
+                        return connection.getResponseCode() == 200;
+
+                } catch (Exception e) {
+
+                        return false;
+
+                } finally {
+
+                        if (connection != null) {
+                                connection.disconnect();
+                        }
+                }
+        }
+
+        // =========================================================
+        // MODEL TEST
+        // =========================================================
+
+        public static void main(
+                        String[] args) {
+
+                System.out.println();
+
+                System.out.println(
+                                "==========================================");
+
+                System.out.println(
+                                "       StudySync LocalAI Test");
+
+                System.out.println(
+                                "==========================================");
+
+                System.out.println();
+
+                System.out.println(
+                                "Model: "
+                                                + MODEL);
+
+                System.out.println(
+                                "Ollama: "
+                                                + (isOllamaRunning()
+                                                                ? "ONLINE"
+                                                                : "OFFLINE"));
+
+                System.out.println();
+
+                if (!isOllamaRunning()) {
+
+                        System.out.println(
+                                        "Ollama is not running.");
+
+                        System.out.println(
+                                        "Start it with:");
+
+                        System.out.println(
+                                        "ollama serve");
+
+                        return;
+                }
+
+                try {
+
+                        System.out.println(
+                                        "Sending test request to Qwen3.5 4B...");
+
+                        System.out.println();
+
+                        String response = ask(
+                                        "Say hello to me in one short sentence. "
+                                                        + "Do not explain your reasoning.");
+
+                        System.out.println(
+                                        "Qwen response:");
+
+                        System.out.println(
+                                        "------------------------------------------");
+
+                        System.out.println(
+                                        response);
+
+                        System.out.println(
+                                        "------------------------------------------");
+
+                        System.out.println();
+
+                        System.out.println(
+                                        "LOCAL AI TEST PASSED.");
+
+                } catch (Exception e) {
+
+                        System.out.println();
+
+                        System.out.println(
+                                        "LOCAL AI TEST FAILED.");
+
+                        System.out.println();
+
+                        e.printStackTrace();
+                }
+        }
 }

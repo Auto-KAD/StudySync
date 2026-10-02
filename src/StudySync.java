@@ -5,10 +5,13 @@ import javax.swing.border.EmptyBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import java.awt.*;
+import java.awt.datatransfer.StringSelection;
+
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.geom.RoundRectangle2D;
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
@@ -25,8 +28,8 @@ public class StudySync extends JFrame {
         private static final Color BG_CARD = new Color(28, 28, 38);
         private static final Color BG_CARD_HOVER = new Color(36, 36, 50);
         private static final Color BG_INPUT = new Color(20, 20, 28);
-        private static final Color ACCENT_PRIMARY = new Color(99, 102, 241);     // Indigo
-        private static final Color ACCENT_SECONDARY = new Color(139, 92, 246);   // Purple
+        private static final Color ACCENT_PRIMARY = new Color(99, 102, 241); // Indigo
+        private static final Color ACCENT_SECONDARY = new Color(139, 92, 246); // Purple
         private static final Color ACCENT_GRADIENT_END = new Color(79, 70, 229); // Darker indigo
         private static final Color TEXT_PRIMARY = new Color(237, 237, 242);
         private static final Color TEXT_SECONDARY = new Color(156, 163, 175);
@@ -65,6 +68,14 @@ public class StudySync extends JFrame {
         private File selectedSubjectFolder;
 
         private List<File> currentFiles = new ArrayList<>();
+
+        // Local document-processing and AI services.
+        private final DocumentService documentService = new DocumentService();
+        private final DocumentContextBuilder documentContextBuilder = new DocumentContextBuilder();
+        private final AIService localAI = new LocalAI();
+
+        // Maximum number of document visuals passed to Qwen per request.
+        private static final int MAX_AI_IMAGES = 5;
 
         // Absolute paths of resources selected for AI.
         private final Set<String> selectedAiFiles = new LinkedHashSet<>();
@@ -448,8 +459,7 @@ public class StudySync extends JFrame {
                                                 RenderingHints.VALUE_ANTIALIAS_ON);
 
                                 int w = getWidth(), h = getHeight();
-                                RoundRectangle2D.Float shape =
-                                                new RoundRectangle2D.Float(0, 0, w, h, 12, 12);
+                                RoundRectangle2D.Float shape = new RoundRectangle2D.Float(0, 0, w, h, 12, 12);
 
                                 if (primary) {
                                         GradientPaint gp = new GradientPaint(
@@ -458,7 +468,8 @@ public class StudySync extends JFrame {
                                         g2.setPaint(gp);
                                 } else {
                                         g2.setColor(getModel().isRollover()
-                                                        ? BG_CARD_HOVER : BG_TERTIARY);
+                                                        ? BG_CARD_HOVER
+                                                        : BG_TERTIARY);
                                 }
 
                                 g2.fill(shape);
@@ -482,7 +493,8 @@ public class StudySync extends JFrame {
                 button.setForeground(primary ? Color.WHITE : TEXT_PRIMARY);
                 button.setPreferredSize(new Dimension(
                                 button.getFontMetrics(button.getFont())
-                                                .stringWidth(text) + 40, 38));
+                                                .stringWidth(text) + 40,
+                                38));
                 button.setBorderPainted(false);
                 button.setContentAreaFilled(false);
                 button.setFocusPainted(false);
@@ -1068,6 +1080,178 @@ public class StudySync extends JFrame {
                 showMultiFileAiDialog(files, query);
         }
 
+        /**
+         * Sends selected StudySync resources through the local AI pipeline.
+         *
+         * Pipeline:
+         *
+         * Selected files
+         * -> DocumentService
+         * -> DocumentModel(s)
+         * -> DocumentContextBuilder
+         * -> AIRequest
+         * -> LocalAI / Ollama / Qwen3.5 4B
+         *
+         * No cloud API or Gemini service is used here.
+         */
+        private String askLocalAI(
+                        List<File> files,
+                        String question) throws Exception {
+
+                if (files == null || files.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                        "No resources were selected for AI analysis.");
+                }
+
+                if (question == null || question.trim().isEmpty()) {
+                        throw new IllegalArgumentException(
+                                        "AI question cannot be empty.");
+                }
+
+                // Parse the original documents once for the initial request.
+                // Follow-up questions can reuse the parsed DocumentModel instances.
+                List<DocumentModel> documents = documentService.processFiles(files);
+                return askLocalAIWithDocuments(documents, question);
+        }
+
+        /**
+         * Runs the AI pipeline using already-processed documents.
+         * Follow-up questions use this method so PDFs, DOCX files and PPTX files
+         * are not parsed again and PDF pages are not rendered again.
+         */
+        private String askLocalAIWithDocuments(
+                        List<DocumentModel> documents,
+                        String question) throws Exception {
+
+                return askLocalAIWithDocuments(documents, question, false);
+        }
+
+        private String askLocalAIWithDocuments(
+                        List<DocumentModel> documents,
+                        String question,
+                        boolean forceVisualContext) throws Exception {
+
+                if (documents == null || documents.isEmpty()) {
+                        throw new IllegalArgumentException(
+                                        "No processed resources are available for AI analysis.");
+                }
+
+                if (question == null || question.trim().isEmpty()) {
+                        throw new IllegalArgumentException(
+                                        "AI question cannot be empty.");
+                }
+
+                // Context is rebuilt because the user's question changes between turns.
+                String context = documentContextBuilder.build(
+                                documents,
+                                question);
+
+                // Reuse visual data already generated by the document processors.
+                // For follow-ups, only send visuals when the question actually refers
+                // to visual material. This avoids repeatedly sending several images
+                // to Qwen when the user is asking a text-only follow-up.
+                List<DocumentImage> images = (forceVisualContext || shouldUseVisualContext(question))
+                                ? collectAIImages(documents)
+                                : new ArrayList<>();
+
+                System.out.println(
+                                "StudySync LocalAI: using "
+                                                + documents.size()
+                                                + " cached document(s), "
+                                                + images.size()
+                                                + " visual input(s).");
+
+                AIRequest request = new AIRequest(
+                                question,
+                                context,
+                                images);
+
+                AIResponse response = localAI.ask(request);
+
+                if (response == null ||
+                                response.getContent() == null ||
+                                response.getContent().trim().isEmpty()) {
+
+                        throw new IOException(
+                                        "LocalAI returned an empty response.");
+                }
+
+                return response.getContent();
+        }
+
+        private boolean shouldUseVisualContext(String question) {
+
+                if (question == null || question.trim().isEmpty()) {
+                        return false;
+                }
+
+                String q = question.toLowerCase();
+
+                String[] visualKeywords = {
+                                "image",
+                                "diagram",
+                                "figure",
+                                "fig.",
+                                "chart",
+                                "graph",
+                                "plot",
+                                "flowchart",
+                                "illustration",
+                                "visual",
+                                "screenshot",
+                                "picture",
+                                "shown",
+                                "shown in",
+                                "looks like",
+                                "what does this figure",
+                                "what does this diagram",
+                                "explain the figure",
+                                "explain the diagram"
+                };
+
+                for (String keyword : visualKeywords) {
+                        if (q.contains(keyword)) {
+                                return true;
+                        }
+                }
+
+                return false;
+        }
+
+        private List<DocumentImage> collectAIImages(
+                        List<DocumentModel> documents) {
+
+                List<DocumentImage> images = new ArrayList<>();
+
+                if (documents == null || documents.isEmpty()) {
+                        return images;
+                }
+
+                for (DocumentModel document : documents) {
+
+                        if (document == null || !document.hasImages()) {
+                                continue;
+                        }
+
+                        for (DocumentImage image : document.getImages()) {
+
+                                if (image == null ||
+                                                image.getImageData() == null ||
+                                                image.getImageData().length == 0) {
+                                        continue;
+                                }
+
+                                images.add(image);
+
+                                if (images.size() >= MAX_AI_IMAGES) {
+                                        return images;
+                                }
+                        }
+                }
+
+                return images;
+        }
+
         private void showMultiFileAiDialog(
                         List<File> files,
                         String query) {
@@ -1105,7 +1289,7 @@ public class StudySync extends JFrame {
                 dialogTitle.setForeground(TEXT_PRIMARY);
 
                 JLabel info = new JLabel(
-                                "Analyzing " + files.size()
+                                "Preparing " + files.size()
                                                 + " selected resource"
                                                 + (files.size() == 1 ? "" : "s")
                                                 + "...");
@@ -1127,6 +1311,14 @@ public class StudySync extends JFrame {
                 List<String> conversation = new ArrayList<>();
                 conversation.add("USER: " + query);
 
+                // Cache parsed documents for the lifetime of this AI dialog.
+                // Follow-up questions reuse this data instead of reparsing files.
+                final List<DocumentModel> cachedDocuments = new ArrayList<>();
+                final boolean[] resourcesCached = { false };
+
+                // Copy only the latest AI answer, not the entire conversation pane.
+                final String[] latestAiResponse = { "" };
+
                 StringBuilder chatHtml = new StringBuilder();
                 chatHtml.append(buildChatHtmlHead());
 
@@ -1146,7 +1338,7 @@ public class StudySync extends JFrame {
                                 .append(inlineMarkdown(escapeHtml(query)))
                                 .append("</p>")
                                 .append("<div class='thinking'>")
-                                .append("Analyzing the original files...")
+                                .append("Preparing the original files...")
                                 .append("</div>")
                                 .append("</div></body></html>");
 
@@ -1166,6 +1358,46 @@ public class StudySync extends JFrame {
                 JButton closeButton = createModernButton("Close", false);
                 closeButton.setPreferredSize(new Dimension(80, 34));
 
+                JButton copyButton = createModernButton("Copy", false);
+                copyButton.setPreferredSize(new Dimension(80, 34));
+                copyButton.setToolTipText("Copy the latest AI answer");
+
+                copyButton.addActionListener(e -> {
+
+                        try {
+                                String textToCopy = latestAiResponse[0];
+
+                                if (textToCopy == null ||
+                                                textToCopy.trim().isEmpty()) {
+                                        return;
+                                }
+
+                                Toolkit.getDefaultToolkit()
+                                                .getSystemClipboard()
+                                                .setContents(
+                                                                new StringSelection(textToCopy),
+                                                                null);
+
+                                copyButton.setText("Copied!");
+
+                                Timer timer = new Timer(
+                                                1200,
+                                                event -> copyButton.setText("Copy"));
+
+                                timer.setRepeats(false);
+                                timer.start();
+
+                        } catch (Exception ex) {
+
+                                JOptionPane.showMessageDialog(
+                                                dialog,
+                                                "Could not copy the AI response.\n\n"
+                                                                + ex.getMessage(),
+                                                "Copy Error",
+                                                JOptionPane.ERROR_MESSAGE);
+                        }
+                });
+
                 JLabel chatStatus = new JLabel(
                                 "Ask follow-up questions without reopening resources");
                 chatStatus.setForeground(TEXT_MUTED);
@@ -1181,9 +1413,15 @@ public class StudySync extends JFrame {
                 bottom.setBackground(BG_PRIMARY);
                 bottom.add(chatStatus, BorderLayout.NORTH);
                 bottom.add(chatInput, BorderLayout.CENTER);
+                JPanel closePanel = new JPanel(
+                                new FlowLayout(
+                                                FlowLayout.RIGHT,
+                                                10,
+                                                6));
 
-                JPanel closePanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 14, 6));
                 closePanel.setBackground(BG_PRIMARY);
+
+                closePanel.add(copyButton);
                 closePanel.add(closeButton);
                 bottom.add(closePanel, BorderLayout.SOUTH);
 
@@ -1223,13 +1461,22 @@ public class StudySync extends JFrame {
 
                                 @Override
                                 protected String doInBackground() throws Exception {
-                                        return GeminiAI.analyzeFiles(files, context);
+                                        if (!resourcesCached[0] || cachedDocuments.isEmpty()) {
+                                                throw new IllegalStateException(
+                                                                "The selected resources are still being prepared. Please wait for the first answer.");
+                                        }
+
+                                        return askLocalAIWithDocuments(
+                                                        cachedDocuments,
+                                                        context,
+                                                        shouldUseVisualContext(message));
                                 }
 
                                 @Override
                                 protected void done() {
                                         try {
                                                 String result = get();
+                                                latestAiResponse[0] = result;
                                                 conversation.add("ASSISTANT: " + result);
                                                 appendChatMessage(output, chatHtml,
                                                                 "StudySync AI", result, true);
@@ -1241,7 +1488,8 @@ public class StudySync extends JFrame {
 
                                         } catch (Exception ex) {
                                                 Throwable cause = ex.getCause() != null
-                                                                ? ex.getCause() : ex;
+                                                                ? ex.getCause()
+                                                                : ex;
                                                 appendChatMessage(output, chatHtml,
                                                                 "StudySync AI",
                                                                 "I couldn't process that follow-up.\n\n"
@@ -1296,13 +1544,33 @@ public class StudySync extends JFrame {
                 SwingWorker<String, Void> worker = new SwingWorker<>() {
                         @Override
                         protected String doInBackground() throws Exception {
-                                return GeminiAI.analyzeFiles(files, query);
+                                List<DocumentModel> documents = documentService.processFiles(files);
+
+                                if (documents == null || documents.isEmpty()) {
+                                        throw new IllegalStateException(
+                                                        "No readable document content was produced.");
+                                }
+
+                                // Cache parsed documents so follow-up questions do not
+                                // reopen files or render PDF pages again.
+                                cachedDocuments.clear();
+                                cachedDocuments.addAll(documents);
+                                resourcesCached[0] = true;
+
+                                SwingUtilities.invokeLater(
+                                                () -> info.setText("StudySync AI is thinking..."));
+
+                                return askLocalAIWithDocuments(
+                                                cachedDocuments,
+                                                query,
+                                                true);
                         }
 
                         @Override
                         protected void done() {
                                 try {
                                         String result = get();
+                                        latestAiResponse[0] = result;
                                         conversation.add("ASSISTANT: " + result);
 
                                         chatHtml.setLength(0);
@@ -1327,13 +1595,15 @@ public class StudySync extends JFrame {
 
                                 } catch (Exception ex) {
                                         Throwable cause = ex.getCause() != null
-                                                        ? ex.getCause() : ex;
+                                                        ? ex.getCause()
+                                                        : ex;
 
                                         chatHtml.setLength(0);
                                         chatHtml.append(buildChatHtmlHead());
                                         chatHtml.append("<div class='ai error'><div class='label'>Error</div>")
                                                         .append("<p>StudySync AI could not analyze the selected resources.</p>")
-                                                        .append("<p>").append(escapeHtml(safeMessage(cause))).append("</p>")
+                                                        .append("<p>").append(escapeHtml(safeMessage(cause)))
+                                                        .append("</p>")
                                                         .append("</div></body></html>");
 
                                         output.setText(chatHtml.toString());
@@ -1576,16 +1846,16 @@ public class StudySync extends JFrame {
          * Robust Markdown-to-HTML renderer for Swing's JEditorPane.
          *
          * Converts the Markdown formatting commonly returned by LLMs
-         * (Gemini, etc.) into clean, structured HTML:
-         *   - # / ## / ### headings
-         *   - **bold**, *italic*, `inline code`
-         *   - Bullet and numbered lists (including nested)
-         *   - Fenced code blocks (```)
-         *   - Markdown tables
-         *   - Horizontal rules
-         *   - Blockquotes (>)
-         *   - LaTeX display equations ($$...$$)
-         *   - Inline math ($...$)
+         * (local and cloud LLMs) into clean, structured HTML:
+         * - # / ## / ### headings
+         * - **bold**, *italic*, `inline code`
+         * - Bullet and numbered lists (including nested)
+         * - Fenced code blocks (```)
+         * - Markdown tables
+         * - Horizontal rules
+         * - Blockquotes (>)
+         * - LaTeX display equations ($$...$$)
+         * - Inline math ($...$)
          *
          * Raw markdown characters (##, **, <>, etc.) are never shown
          * to the user — they are always converted to proper HTML.
@@ -1684,7 +1954,8 @@ public class StudySync extends JFrame {
                                         inBlockquote = true;
                                 }
                                 String quoteContent = line.length() > 2
-                                                ? line.substring(2) : "";
+                                                ? line.substring(2)
+                                                : "";
                                 html.append("<p>")
                                                 .append(inlineMarkdown(escapeHtml(quoteContent)))
                                                 .append("</p>");
@@ -2122,7 +2393,8 @@ public class StudySync extends JFrame {
                         ext = "TXT";
                         bg = new Color(14, 165, 233, 32);
                         fg = new Color(56, 189, 248);
-                } else if (name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".tar") || name.endsWith(".gz")) {
+                } else if (name.endsWith(".zip") || name.endsWith(".rar") || name.endsWith(".tar")
+                                || name.endsWith(".gz")) {
                         ext = "ZIP";
                         bg = new Color(234, 179, 8, 32);
                         fg = new Color(250, 204, 21);
