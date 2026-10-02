@@ -89,6 +89,7 @@ public class ResourceCluster {
                 "course_outline",
                 "curriculum",
                 "academic policy",
+                "cp",
                 "scheme",
                 "course structure")) {
 
@@ -115,25 +116,21 @@ public class ResourceCluster {
     }
 
     private static String getExtension(
-            String fileName
-    ) {
+            String fileName) {
 
-        int dot =
-                fileName.lastIndexOf('.');
+        int dot = fileName.lastIndexOf('.');
 
         if (dot == -1) {
             return "";
         }
 
         return fileName.substring(
-                dot + 1
-        );
+                dot + 1);
     }
 
     private static boolean containsAny(
             String text,
-            String... keywords
-    ) {
+            String... keywords) {
 
         for (String keyword : keywords) {
 
@@ -146,16 +143,12 @@ public class ResourceCluster {
     }
 
     private static boolean containsYear(
-            String text
-    ) {
+            String text) {
 
-        for (int year = 2018;
-             year <= 2035;
-             year++) {
+        for (int year = 2018; year <= 2035; year++) {
 
             if (text.contains(
-                    String.valueOf(year)
-            )) {
+                    String.valueOf(year))) {
                 return true;
             }
         }
