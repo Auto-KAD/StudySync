@@ -57,7 +57,7 @@ public class LocalAI implements AIService {
          * This prevents accidentally sending dozens of
          * rendered document pages to the local model.
          */
-        private static final int MAX_IMAGES_PER_REQUEST = 5;
+        private static final int MAX_IMAGES_PER_REQUEST = 2;
 
         private static final int CONNECT_TIMEOUT = 10_000;
 
@@ -462,7 +462,8 @@ public class LocalAI implements AIService {
                 json.append("\"think\":false,");
 
                 json.append("\"options\":{");
-                json.append("\"num_ctx\":16384");
+                json.append("\"num_ctx\":12288,");
+                json.append("\"num_predict\":2048");
                 json.append("},");
 
                 json.append(

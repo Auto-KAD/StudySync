@@ -32,6 +32,13 @@ public class PDFProcessor implements DocumentProcessor {
      */
     private static final int MAX_IMAGE_WIDTH = 2400;
     private static final int MAX_IMAGE_HEIGHT = 2400;
+    
+    /**
+     * Prevent unbelievable rendering times and out-of-memory 
+     * conditions when processing scanned PDFs or PDFs with 
+     * hundreds of visual pages.
+     */
+    private static final int MAX_RENDERED_IMAGES = 5;
 
     // =========================================================
     // FILE SUPPORT
@@ -129,7 +136,7 @@ public class PDFProcessor implements DocumentProcessor {
 
                 boolean hasImage = pageContainsImage(pdfPage);
 
-                if (hasImage) {
+                if (hasImage && model.getImageCount() < MAX_RENDERED_IMAGES) {
 
                     System.out.println(
                             "Visual content detected on PDF page "
